@@ -313,5 +313,6 @@ special_tokens.txt → 每行一个特殊 token
 ### 测试
 
 ```bash
-
+uv run pytest tests/test_train_bpe.py
+uv run pytest tests/test_tokenizer.py
 ```
