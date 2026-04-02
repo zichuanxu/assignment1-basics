@@ -322,3 +322,20 @@ special_tokens.txt → 每行一个特殊 token
 uv run pytest tests/test_train_bpe.py
 uv run pytest tests/test_tokenizer.py
 ```
+
+### 训练
+
+们通过运行以下代码来完成TinyStory的Tokenization与保存：
+```bash
+uv run python ./train_bpe.py
+```
+在训练完之后，我们可以到的一下的directory
+```
+datasets/
+└── tiny_stories/
+    ├── eval.bin
+    ├── merges.txt
+    ├── special_tokens.txt
+    ├── train.bin
+    └── vocab.json
+```
