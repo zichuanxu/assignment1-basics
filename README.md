@@ -160,8 +160,7 @@ chunks = find_chunk_boundaries(f, desired_num_chunks=NUM_PROCESSES, split_specia
 
 一个很明显的优化点是：每一轮都要找当前频率最高的 pair。在 Version 0 (Section 2.2) 里，我们每轮都通过遍历 pairs_counter 来取最大值，这一步是$O(n)$
 （n是 pair 的数量）。而这个操作正好符合堆（heap）的使用场景：用堆维护“当前最大的元素”，就能把“取最大”降到$O(\log n)$
-（严格来说是：取堆顶是$O(1)$，但如果包含 pop/push 更新则是$O(\log n)$
-）。
+（严格来说是：取堆顶是$O(1)$，但如果包含 pop/push 更新则是 $O(\log n)$ ）。
 
 具体做法是把每个 pair 作为堆元素，并把“排序依据”设计成：
 
@@ -246,6 +245,13 @@ for _ in trange(num_merges):
 **我们的做法：双向链表 + 最小堆。** 核心观察是，**不是每条 merge 规则都需要检查**。只有那些「当前存在的 pair 恰好出现在 merges 表中」的位置才可能发生合并。于是：
 
 ```
+
+堆里存 (rank, i)，表示当前位置 i 与其右邻居 nxt[i] 的 pair 在 merge 规则中的优先级（rank 越小越先合并）。
+每次取出最小 rank 的候选，做一次合并，然后只需要重新检查局部的两个 pair：
+
+(prev[i], i)
+(i, nxt[i])
+
 输入 pre-token: [72, 101, 108, 108, 111]  （"Hello" 的初始 byte IDs）
 
 ① 扫描一遍，检查每个相邻 pair 是否在 merges 表中

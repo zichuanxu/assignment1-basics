@@ -298,7 +298,10 @@ class BPETokenizer:
 
         self.vocab_inv = {v: k for k, v in self.vocab.items()}
 
+        # 记录合并的优先级。在 merges 列表里越靠前（r 越小），优先级越高。
+        # 比如遇到 h e l l o，如果 h e 排第 1，l l 排第 5，那就必须先合并 h e。
         rank: dict[tuple[int, int], int] = {}
+        # 速查表。直接记录 (ID_h, ID_e) -> ID_he。有了它，合并时瞬间就能拿到新 ID。
         merge_to_new_id: dict[tuple[int, int], int] = {}
 
         for r, (a_bytes, b_bytes) in enumerate(self.merges):
@@ -317,6 +320,16 @@ class BPETokenizer:
 
         self.eos_token_id = self.vocab_inv.get(b"<|endoftext|>", None)
 
+    """
+    当拿到一句长长的文本，比如 "Hello world! <|endoftext|>"，不能直接把它全拆成单字母。
+
+    保护特殊符号：把 <|endoftext|> 这种单独拎出来，它不参与合并。
+
+    正则切分（PAT）：把 "Hello world!" 切成 "Hello", " ", "world", "!"。
+
+    转成 Bytes：最后把每个碎片转成 utf-8 字节。
+    """
+
     def _pre_tokenize(self, text: str) -> list[bytes]:
         parts = split_by_special_tokens(text, self.special_tokens, include_special=True)
         token_list: list[bytes] = []
@@ -333,12 +346,23 @@ class BPETokenizer:
 
         return token_list
 
+    """
+    如果用普通的数组来合并，每次把两个元素变成一个元素，数组后面的所有元素都要往前挪一位。如果句子很长，这种操作会慢得让人崩溃。
+    这段代码使用了一个高级数据结构组合：双向链表 (Doubly-Linked List) + 优先队列/堆 (Heap)。
+    """
+
     def encode(self, text: str) -> list[int]:
         def merge_one_pretoken(ids: list[int]) -> list[int]:
             n = len(ids)
             if n <= 1:
                 return ids
 
+            """
+            合并时并不真的 del 掉元素，而是：
+            标记被吞掉的节点 alive[j] = False
+            调整指针 nxt[i] = nxt[j]、prev[nxt[j]] = i
+            这样就能在 O(1) 时间内完成合并，而不需要移动后续元素。
+            """
             alive = [True] * n
 
             # Doubly-linked list over positions 0..n-1 (positions are stable; nodes get "deleted")
@@ -347,7 +371,15 @@ class BPETokenizer:
             for i in range(n):
                 prev[i] = i - 1
                 nxt[i] = i + 1 if i + 1 < n else -1
+            """
+            堆里存 (rank, i)，
+            表示当前位置 i 与其右邻居 nxt[i] 的 pair 在 merge 规则中的优先级（rank 越小越先合并）。
+            每次取出最小 rank 的候选，做一次合并，然后只需要重新检查局部的两个 pair：
 
+            (prev[i], i)
+            (i, nxt[i])
+
+            """
             # best pair per left-position i: (rank, i)
             heap: list[tuple[int, int]] = []
 
@@ -364,38 +396,58 @@ class BPETokenizer:
 
             for i in range(n):
                 push_if_valid(i)
+            """
 
-            while heap:
-                r, i = heapq.heappop(heap)
-                j = nxt[i]
-                if j == -1 or not alive[i] or not alive[j]:
+            与之前的heap一样，heap里面的内容会 “过期”：
+            因为合并会改变邻接关系，堆中旧条目会过期，所以每次 pop 出来都要验证,
+
+            接下来就是遍历这个heap，
+            如果这个heap不是空的，我们就弹出，并且验证：
+
+            这段 while heap: 是整个 merge_one_pretoken 的核心：
+            堆里维护“当前可合并的相邻 pair”，
+            每次取出 rank 最小（最优先） 的候选进行合并，并只更新合并点附近的候选。
+            """
+            while heap:  # 只要还有候选 pair，就继续尝试合并
+                r, i = heapq.heappop(
+                    heap
+                )  # 取出当前 rank 最小的候选：(rank, 左端点位置 i)
+                j = nxt[i]  # 右端点位置 j 是 i 在链表中的后继
+                if (
+                    j == -1 or not alive[i] or not alive[j]
+                ):  # i/j 无效或 i 已到尾部：这是过期候选
                     continue
-                # stale check: rank might no longer match current neighbor
+                # stale check：堆里的记录可能已过期（邻居关系/ids 已改变），需要重新验证
+                # 注意后面合并后nxt[i]会变，所以每次都要检查当前 i 和 j 的 pair 是否仍然匹配当前 rank
                 pair = (ids[i], ids[j])
-                cur_r = self.rank.get(pair)
-                if cur_r is None or cur_r != r:
+                cur_r = self.rank.get(
+                    pair
+                )  # 查询这个 pair 在 merge 规则中的 rank（不可合并则为 None）
+                if (
+                    cur_r is None or cur_r != r
+                ):  # 现在不可合并，或 rank 已不匹配：说明堆元素过期
                     continue
 
-                # merge i and j into i (use precomputed mapping to avoid KeyError)
+                # 执行合并：把 (ids[i], ids[j]) 合成一个新 token，并写回到位置 i
                 new_id = self.merge_to_new_id.get(pair)
                 if new_id is None:
                     continue
                 ids[i] = new_id
 
-                # delete j from the linked list
+                # 从链表中删除 j：j 被 i 吞掉了
                 alive[j] = False
                 nj = nxt[j]
                 nxt[i] = nj
                 if nj != -1:
                     prev[nj] = i
 
-                # Only pairs that can change are around i (prev[i], i) and (i, nxt[i])
+                # 局部更新：合并只会影响 i 附近的两个相邻 pair
                 pi = prev[i]
                 if pi != -1:
-                    push_if_valid(pi)
-                push_if_valid(i)
+                    push_if_valid(pi)  # (pi, i) 这个 pair 可能变得可合并或 rank 改变
+                push_if_valid(i)  # (i, nxt[i]) 这个 pair 也可能变得可合并或 rank 改变
 
-            # materialize result by walking the linked list
+            # 最终合并后的 token id 序列
             out: list[int] = []
             k = 0
             while k != -1:
@@ -406,6 +458,10 @@ class BPETokenizer:
 
         byte_tokens = self._pre_tokenize(text)
 
+        """
+        Pre-tokenization：先粗粒度切分文本
+        对每个切分出来的 pre-token 做 BPE merge (merge_one_pretoken)，得到最终的 token ID 序列。
+        """
         token_ids: list[int] = []
         for btok in byte_tokens:
             if btok in self.special_set:
