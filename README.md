@@ -339,3 +339,442 @@ datasets/
     ├── train.bin
     └── vocab.json
 ```
+
+---
+
+## Language Model 实现
+
+### 整体架构
+
+在 BPE 分词器把文本转换为 token IDs 之后，我们需要搭建一个完整的语言模型来学习这些 token 的分布。整体流程可以概括为：
+
+```
+Token IDs → Embedding → [TransformerBlock × num_layers] → Final Norm → Output Layer → Vocabulary Logits
+```
+
+每个 TransformerBlock 内部采用 **Pre-Norm** 结构：
+
+```
+x → RMSNorm → MHA (RoPE + Causal) → Residual → RMSNorm → SwiGLU-FFN → Residual → 输出
+```
+
+### 核心组件速查
+
+| 组件 | 文件 | 作用 |
+|---|---|---|
+| `Linear` | `modules/linear.py` | 自定义线性层（支持权重初始化策略） |
+| `Embedding` | `modules/embedding.py` | Token ID → 向量映射 |
+| `RMSNorm` | `modules/norm.py` | 归一化层，替代 LayerNorm |
+| `RoPEEmbedding` | `modules/rope.py` | 旋转位置编码 |
+| `MHA` | `modules/attention.py` | 多头自注意力（含 RoPE + Causal Mask） |
+| `FFN` | `modules/ffn.py` | SwiGLU 前馈网络 |
+| `TransformerBlock` | `model.py` | 完整的 Transformer 层 |
+| `TransformerLM` | `model.py` | 完整语言模型 |
+
+---
+
+### 基础组件
+
+#### Linear 层
+
+自定义的 `Linear` 类封装了 `nn.Linear`，主要目的是统一权重初始化策略，方便后续实验调整。所有矩阵乘法（Q/K/V 投影、FFN、输出头）都通过这个类完成。
+
+#### Embedding 层
+
+```
+Token IDs (batch, seq_len) → Embedding → (batch, seq_len, d_model)
+```
+
+把离散的 token ID 映射到连续的向量空间。这是模型学习语义表示的第一步。
+
+---
+
+### RMSNorm（Root Mean Square Layer Normalization）
+
+#### 为什么不用 LayerNorm？
+
+LayerNorm 同时计算均值和方差来做归一化：
+
+```python
+# LayerNorm: 减去均值，除以标准差
+x_norm = (x - mean) / std
+```
+
+RMSNorm 去掉了均值项，只保留 RMS（均方根）：
+
+```python
+# RMSNorm: 只除以 RMS
+rms = sqrt(mean(x²) + eps)
+x_norm = x / rms
+```
+
+**优点：**
+- 计算更简单，少一次减法操作
+- Llama、Mistral 等现代 LLM 都采用 RMSNorm
+- 实验表明去掉均值项对性能影响极小
+
+#### 实现要点
+
+```python
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5):
+        self.weight = nn.Parameter(torch.ones(d_model))  # 可学习的缩放因子
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)  # 数值稳定性：在 fp32 下计算
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        x_normed = x / rms
+        return (x_normed * self.weight).to(input_dtype)  # 恢复原始精度
+```
+
+**关键细节：**
+- `eps = 1e-5` 防止除零
+- 计算时升到 `float32`，输出时恢复原始 dtype（如 `bfloat16`）
+- `weight` 初始化为全 1，让模型自己学习每个维度的缩放
+
+---
+
+### SwiGLU-FFN（前馈网络）
+
+#### 从 ReLU-FFN 到 SwiGLU
+
+传统的 Transformer FFN 结构：
+
+```python
+# 传统 FFN
+FFN(x) = (x @ W1) · ReLU · W2 + b
+```
+
+现代 LLM（Llama、PaLM）广泛采用 **SwiGLU** 变体：
+
+```python
+# SwiGLU FFN
+FFN(x) = (SiLU(x @ W_up) * (x @ W_gate)) @ W_down
+```
+
+其中 `SiLU(x) = x * sigmoid(x)` 是 Sigmoid-Linear-Unit 激活函数。
+
+#### 为什么用 SwiGLU？
+
+| 维度 | ReLU-FFN | SwiGLU-FFN |
+|---|---|---|
+| 参数量 | 2 个矩阵 (W1, W2) | 3 个矩阵 (W_up, W_gate, W_down) |
+| 表达能力 | 单路变换 | 门控机制（gate 控制信息流） |
+| 实际效果 | 基线 | 同等参数量下效果更好 |
+
+SwiGLU 的核心思想是**门控**：`x @ W_gate` 学习"哪些信息应该通过"，`SiLU(x @ W_up)` 学习"要传递什么信息"，两者逐元素相乘实现动态信息路由。
+
+#### 实现
+
+```python
+class FFN(nn.Module):
+    def __init__(self, d_model: int, d_ff: int):
+        self.up = Linear(d_model, d_ff)      # 上投影
+        self.gate = Linear(d_model, d_ff)    # 门控投影
+        self.down = Linear(d_ff, d_model)    # 下投影
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(silu(self.up(x)) * self.gate(x))
+```
+
+注意 `d_ff` 通常设置为 `d_model` 的 2-4 倍（如 d_model=768, d_ff=3072），中间层更宽以增强表达能力。
+
+---
+
+### RoPE（Rotary Position Embedding）
+
+#### 位置编码的演进
+
+| 方法 | 原理 | 缺点 |
+|---|---|---|
+| 绝对位置编码 | 在 embedding 上加可学习的位置向量 | 外推性差（超出训练长度效果骤降） |
+| 相对位置编码 | 在注意力分数中编码相对距离 | 实现复杂，计算开销大 |
+| **RoPE** | 通过旋转矩阵注入位置信息 | 当前主流方案 |
+
+#### RoPE 的核心思想
+
+RoPE 不直接"加"位置信息，而是通过**旋转**向量的方式来编码位置。
+
+对于二维向量 $(x_1, x_2)$ 和位置 $m$，旋转操作为：
+
+$$
+\begin{pmatrix} x_1' \\ x_2' \end{pmatrix} = \begin{pmatrix} \cos(m\theta) & -\sin(m\theta) \\ \sin(m\theta) & \cos(m\theta) \end{pmatrix} \begin{pmatrix} x_1 \\ x_2 \end{pmatrix}
+$$
+
+**关键性质：** 两个位置 $m$ 和 $n$ 的向量做内积时，结果只依赖于相对位置 $m-n$：
+
+$$
+\langle f_q(x, m), f_k(y, n) \rangle = \text{只与 } (m-n) \text{ 有关的函数}
+$$
+
+这正是注意力机制需要的——我们关心的是 token 之间的**相对距离**，而不是绝对位置。
+
+#### 高维推广
+
+对于 $d_k$ 维向量，把它拆成 $d_k/2$ 个二维平面，每个平面用不同的旋转频率：
+
+$$
+\theta_i = \theta^{-2i/d_k} \quad (i = 0, 1, ..., d_k/2-1)
+$$
+
+其中 $\theta$ 是基础频率（通常设为 10000）。频率随维度递减，低维用高频（捕捉短距离关系），高维用低频（捕捉长距离关系）。
+
+#### 实现要点
+
+```python
+class RoPEEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int):
+        # 预计算逆频率: [d_k/2]
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d_k, 2) / d_k))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x, token_positions=None):
+        # 计算旋转角度: (batch, seq_len, d_k/2)
+        theta = torch.einsum("...i, j -> ...ij", token_positions, self.inv_freq)
+        cos, sin = torch.cos(theta), torch.sin(theta)
+        # repeat_interleave 让每个角度对应两个维度
+        cos = cos.repeat_interleave(2, dim=-1)  # (batch, seq_len, d_k)
+        sin = sin.repeat_interleave(2, dim=-1)
+        # 旋转: x' = x*cos + rotate_half(x)*sin
+        return x * cos + self._rotate_half(x) * sin
+```
+
+**关键细节：**
+- `register_buffer(..., persistent=False)`：buffer 不保存到模型 state_dict
+- `_rotate_half` 用 `einops.rearrange` 把相邻两元素配对，然后 $(-x_2, x_1)$ 实现 90° 旋转
+- RoPE **只作用于 Q 和 K**，不作用于 V（因为 V 是被加权的内容，不需要位置信息）
+- 预计算的 `inv_freq` 在所有 batch 和所有层之间共享
+
+---
+
+### Multi-Head Self-Attention（MHA）
+
+#### Scaled Dot-Product Attention
+
+注意力机制的本质是**加权平均**：
+
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+$$
+
+**为什么要除以 $\sqrt{d_k}$？**
+
+当 $d_k$ 较大时，$QK^T$ 的方差会变大，导致 softmax 的输入绝对值过大。softmax 对大输入非常敏感（梯度趋近于 0），除以 $\sqrt{d_k}$ 可以把方差归一化到 1 附近，保持梯度流动。
+
+**数值稳定的 Softmax：**
+
+```python
+def stable_softmax(logits, dim=-1):
+    max_logits = torch.max(logits, dim=dim, keepdim=True).values
+    exp_logits = torch.exp(logits - max_logits)  # 减去最大值防止溢出
+    return exp_logits / torch.sum(exp_logits, dim=dim, keepdim=True)
+```
+
+减去最大值不改变 softmax 的数学结果（分子分母同乘 $e^{-\max}$），但能避免 `exp()` 溢出。
+
+#### Causal Mask（因果掩码）
+
+语言模型是**自回归**的：预测第 $t$ 个 token 时只能看到前 $t-1$ 个 token。Causal Mask 确保注意力不会"偷看"未来信息：
+
+```python
+def _create_causal_mask(self, seq_len, device):
+    # 下三角矩阵: 位置 (i, j) 为 True 当且仅当 j <= i
+    mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
+    return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+```
+
+应用方式是在 softmax 之前，把 mask 为 0 的位置填充为 $-\infty$：
+
+```python
+scores = scores.masked_fill(mask == 0, float("-inf"))
+```
+
+这样 softmax 之后这些位置的权重就是 0，模型无法关注到未来的 token。
+
+#### 多头机制
+
+单个注意力头只能学习一种"关注模式"。多头注意力把 $d_{model}$ 拆成 $h$ 个头，每个头独立计算注意力，最后拼接：
+
+```
+Q, K, V (batch, seq_len, d_model)
+  → view(batch, seq_len, num_heads, d_k)
+  → transpose(1, 2)  # (batch, num_heads, seq_len, d_k)
+  → 每个头独立计算注意力
+  → transpose(1, 2).contiguous().view(batch, seq_len, d_model)
+```
+
+**为什么需要 `contiguous()`？** `transpose` 返回的是非连续张量（只是改变了 stride），`view` 要求内存连续，所以需要先调用 `contiguous()` 重新排列内存。
+
+#### MHA 完整流程
+
+```python
+class MHA(nn.Module):
+    def forward(self, x, token_positions=None):
+        # 1. 线性投影 + 分头
+        Q = self.q_linear(x).view(...).transpose(1, 2)
+        K = self.k_linear(x).view(...).transpose(1, 2)
+        V = self.v_linear(x).view(...).transpose(1, 2)
+
+        # 2. RoPE 位置编码（只作用于 Q, K）
+        if self.use_rope:
+            Q, K = self.rope(Q, token_positions), self.rope(K, token_positions)
+
+        # 3. Causal Mask
+        causal_mask = self._create_causal_mask(seq_len, x.device)
+
+        # 4. Scaled Dot-Product Attention
+        attn_output = scaled_dot_product_attention(Q, K, V, causal_mask)
+
+        # 5. 合并头 + 输出投影
+        output = self.out_linear(attn_output.transpose(1, 2).contiguous().view(...))
+        return output
+```
+
+---
+
+### TransformerBlock
+
+#### Pre-Norm 结构
+
+```
+x → RMSNorm → MHA → x + MHA_output → RMSNorm → FFN → x + FFN_output
+```
+
+**为什么用 Pre-Norm 而不是 Post-Norm？**
+
+| 维度 | Post-Norm | Pre-Norm |
+|---|---|---|
+| 归一化位置 | 子层之后 | 子层之前 |
+| 梯度流 | 深层容易梯度消失 | 残差路径畅通 |
+| 训练稳定性 | 需要 warmup | 更稳定 |
+| 可训练深度 | 通常 ≤ 24 层 | 可以更深 |
+
+Pre-Norm 的核心优势是**残差路径更干净**：输入 $x$ 直接加到子层输出上，不经过归一化，梯度可以无损地回传。
+
+#### 实现
+
+```python
+class TransformerBlock(nn.Module):
+    def forward(self, x, token_positions=None):
+        # Pre-Norm + MHA + Residual
+        x = x + self.mha(self.norm1(x), token_positions=token_positions)
+        # Pre-Norm + FFN + Residual
+        x = x + self.ffn(self.norm2(x))
+        return x
+```
+
+简洁但强大。每个 block 的输入输出形状保持一致 `(batch, seq_len, d_model)`，可以任意堆叠。
+
+---
+
+### TransformerLM（完整语言模型）
+
+#### 整体流程
+
+```
+Token IDs (batch, seq_len)
+    ↓
+Embedding → (batch, seq_len, d_model)
+    ↓
+[TransformerBlock × num_layers]
+    ↓
+Final RMSNorm
+    ↓
+Output Layer (RMSNorm + Linear) → (batch, seq_len, vocab_size)
+    ↓
+Logits（用于 next-token prediction）
+```
+
+#### 实现
+
+```python
+class TransformerLM(nn.Module):
+    def __init__(self, config: ModelConfig):
+        self.token_embedding = Embedding(config.vocab_size, config.d_model)
+        self.layers = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.num_layers)
+        ])
+        self.final_norm = RMSNorm(config.d_model)
+        self.output_layer = OutputLayer(
+            config.d_model, config.vocab_size, use_norm=config.use_final_norm
+        )
+
+        if config.tie_weights:
+            self._tie_weights()
+
+    def forward(self, x, token_positions=None):
+        x = self.token_embedding(x)
+        for layer in self.layers:
+            x = layer(x, token_positions=token_positions)
+        x = self.final_norm(x)
+        logits = self.output_layer(x)
+        return logits
+```
+
+#### Weight Tying（权重共享）
+
+当 `tie_weights=True` 时，输出层的权重矩阵与 embedding 矩阵共享：
+
+```python
+def _tie_weights(self):
+    self.output_layer.linear.weight = self.token_embedding.weight
+```
+
+**好处：**
+- 减少参数量（省一个 $d_{model} \times vocab_{size}$ 的矩阵）
+- 实验表明对语言模型性能有正面影响（GPT-2 采用此策略）
+- 相当于让 embedding 和输出层学习同一套语义表示
+
+#### Output Layer 设计
+
+```python
+class OutputLayer(nn.Module):
+    def __init__(self, d_model, vocab_size, use_norm=False):
+        self.linear = Linear(d_model, vocab_size)
+        self.norm = RMSNorm(d_model) if use_norm else nn.Identity()
+
+    def forward(self, x):
+        x = self.norm(x)
+        return self.linear(x)
+```
+
+可选的 final norm 在输出头之前再做一次归一化，进一步稳定 logits 分布。
+
+---
+
+### 测试
+
+```bash
+# 测试所有模型组件
+uv run pytest tests/test_model.py
+
+# 测试特定组件
+uv run pytest tests/test_model.py::test_run_transformer_block
+uv run pytest tests/test_model.py::test_run_rope
+uv run pytest tests/test_model.py::test_run_multihead_self_attention_with_rope
+
+# 测试 nn 工具函数
+uv run pytest tests/test_nn_utils.py
+```
+
+测试覆盖了：
+- `Linear` / `Embedding` 基础层
+- `RMSNorm` / `SwiGLU` / `SiLU` 归一化和激活
+- `scaled_dot_product_attention`（含 4D 张量版本）
+- `RoPE` 位置编码
+- `Multi-Head Self-Attention`（含/不含 RoPE）
+- `TransformerBlock` 完整前向传播
+- `TransformerLM` 完整模型（含截断输入测试）
+
+### 关键设计决策总结
+
+| 决策 | 选择 | 原因 |
+|---|---|---|
+| 归一化 | RMSNorm | 更简单，Llama 等现代模型标准 |
+| 归一化位置 | Pre-Norm | 训练更稳定，支持更深模型 |
+| 位置编码 | RoPE | 相对位置编码，外推性好 |
+| FFN 激活 | SwiGLU | 门控机制，同等参数量效果更好 |
+| 注意力掩码 | Causal Mask | 自回归生成，防止未来信息泄露 |
+| 权重共享 | 可选 tie_weights | 减少参数，GPT-2 标准做法 |
+| Softmax | 减 max 数值稳定 | 防止 exp 溢出 |

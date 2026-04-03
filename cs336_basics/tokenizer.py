@@ -1,7 +1,8 @@
 from collections import defaultdict
 import regex as re
 from collections import Counter
-from cs336_basics.utils import string_to_bytes, HeapItem, deprecated
+from cs336_basics.utils_bpe import string_to_bytes, HeapItem
+from cs336_basics.utils import deprecated
 import heapq
 from collections.abc import Iterable, Iterator
 import json

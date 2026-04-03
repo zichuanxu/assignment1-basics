@@ -8,14 +8,14 @@ from cs336_basics.tokenizer import (
 from collections import Counter, defaultdict
 import os
 from multiprocessing import Process, Manager
-from cs336_basics.utils import (
+from cs336_basics.utils_bpe import (
     build_pair_heap,
     pop_most_frequent_pair,
     find_chunk_boundaries,
-    print_color,
     save_vocab_and_merges,
     timeit,
 )
+from cs336_basics.utils import print_color
 from tqdm import tqdm, trange
 from queue import Empty
 import numpy as np
