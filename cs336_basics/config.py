@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
+from cs336_basics.utils_train import get_device
 
 
 @dataclass
@@ -86,7 +87,7 @@ class TrainingConfig:
     # Others:
     model_name: str = "tiny_stories_transformer"
     save_checkpoint_dir: str = "checkpoints"
-    device: str = "mps"  # "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = get_device()
     debug_mode: bool = False
     use_mixed_precision: bool = True
     log_moe_every: int = 500

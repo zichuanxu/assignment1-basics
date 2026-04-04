@@ -152,7 +152,7 @@ chunks = find_chunk_boundaries(f, desired_num_chunks=NUM_PROCESSES, split_specia
 
 使用 Special Token-aware Splitting 和 Regex-based Pre-Tokenizatio，把文本拆成单词级 token 元组，统计每个 token 元组出现多少次。
 
-- Special Token-aware Splitting: 我们已经了解过了，在初始化vocab 时，我们也需要初始化special tokens，其中一个常见的special tokens就是 <|endoftext|>. 这个token意味着一段文本的结束。给出一段很长的文本，我们要做的第一件事情就是把这个文本分成许多段。
+- Special Token-aware Splitting: 我们已经了解过了，在初始化vocab 时，我们也需要初始化special tokens，其中一个常见的special tokens就是  . 这个token意味着一段文本的结束。给出一段很长的文本，我们要做的第一件事情就是把这个文本分成许多段。
 - Regex-based Pre-Tokenization: Pre-Tokenization（预分词） 就是在真正训练 BPE 合并规则之前，先对整份语料做一次粗粒度的切分，把文本切成一段段“更大的片段”（pre-token），然后在这些片段内部去统计相邻字节（byte pair）的出现频率。具体来说，使用GPT-2 使用的那条正则表达式PAT。
 
 **Step 2 — 构建 pair 频率堆 + 倒排索引**
@@ -160,7 +160,7 @@ chunks = find_chunk_boundaries(f, desired_num_chunks=NUM_PROCESSES, split_specia
 
 一个很明显的优化点是：每一轮都要找当前频率最高的 pair。在 Version 0 (Section 2.2) 里，我们每轮都通过遍历 pairs_counter 来取最大值，这一步是$O(n)$
 （n是 pair 的数量）。而这个操作正好符合堆（heap）的使用场景：用堆维护“当前最大的元素”，就能把“取最大”降到$O(\log n)$
-（严格来说是：取堆顶是$O(1)$，但如果包含 pop/push 更新则是 $O(\log n)$ ）。
+（严格来说是：取堆顶是$O(1)$，但如果包含 pop/push 更新则是 $O(\log n)$  ）。
 
 具体做法是把每个 pair 作为堆元素，并把“排序依据”设计成：
 
@@ -778,3 +778,505 @@ uv run pytest tests/test_nn_utils.py
 | 注意力掩码 | Causal Mask | 自回归生成，防止未来信息泄露 |
 | 权重共享 | 可选 tie_weights | 减少参数，GPT-2 标准做法 |
 | Softmax | 减 max 数值稳定 | 防止 exp 溢出 |
+
+---
+
+## 优化器与训练流程
+
+### 整体架构
+
+模型搭建完成后，我们需要优化器来更新参数，以及训练引擎来组织完整的前向-反向-优化循环。整体流程可以概括为：
+
+```
+数据加载 → 前向传播 → Cross-Entropy Loss → 反向传播 → 梯度裁剪 → AdamW 更新 → LR 调度
+```
+
+每个训练步骤的关键组件：
+
+| 组件 | 文件 | 作用 |
+|---|---|---|
+| `cross_entropy` | `loss.py` | 计算交叉熵损失 |
+| `AdamW` | `optim.py` | 带权重衰减的 Adam 优化器 |
+| `cosine_annealing_lr` | `optim.py` | 线性 warmup + 余弦退火学习率调度 |
+| `gradient_clip` | `optim.py` | 梯度裁剪（L2 范数） |
+| `data_loading_sequential` | `data.py` | 顺序数据加载（无重叠 batch） |
+| `train` / `eval_model` | `train_engine.py` | 训练循环与评估逻辑 |
+
+---
+
+### 交叉熵损失（Cross-Entropy Loss）
+
+#### 从 Logits 到 Loss
+
+语言模型的输出是 **logits**（未归一化的分数），形状为 `(batch * seq_len, vocab_size)`。我们需要将其转换为概率分布，然后计算真实 token 的负对数概率。
+
+```
+logits (N, C) → softmax → probs (N, C) → 取真实标签位置的概率 p → loss = -log(p)
+```
+
+#### 数值稳定性：减去最大值
+
+直接计算 `exp(logits)` 会导致溢出——当 logits 中某个值很大时（如 1000），`exp(1000)` 会返回 `inf`。
+
+**解决方案：** 对每个样本减去其 logits 的最大值：
+
+```python
+logits = logits - torch.max(logits, dim=1, keepdim=True).values
+```
+
+**数学等价性：** softmax 具有平移不变性：
+
+$$
+\text{softmax}(x - c) = \frac{e^{x_i - c}}{\sum_j e^{x_j - c}} = \frac{e^{x_i}}{\sum_j e^{x_j}} = \text{softmax}(x)
+$$
+
+减去最大值不改变最终的概率分布，但能确保 `exp()` 的输入 ≤ 0，永远不会溢出。
+
+#### 完整实现
+
+```python
+def cross_entropy(logits: torch.Tensor, labels: torch.Tensor):
+    # 1. 数值稳定：减去最大值
+    logits = logits - torch.max(logits, dim=1, keepdim=True).values
+
+    # 2. 计算 log_softmax: logP(x) = logits - log(sum(exp(logits)))
+    log_probs = logits - torch.log(torch.sum(torch.exp(logits), dim=1, keepdim=True))
+
+    # 3. 只提取真实标签位置的对数概率
+    labels = labels.unsqueeze(1)  # (N, 1)
+    loss = log_probs.gather(1, labels).squeeze(1)  # (N,)
+
+    # 4. 取平均
+    return -loss.mean()
+```
+
+**`gather` 的作用：** `log_probs` 是 `(N, C)` 的矩阵，包含每个样本对所有词的对数概率。但计算 loss 时我们只关心**正确答案**对应的概率。`gather(1, labels)` 从每行中挑出真实标签位置的值，等价于：
+
+```python
+# 等价于：
+loss = torch.tensor([log_probs[i, labels[i]] for i in range(N)])
+```
+
+但 `gather` 是向量化操作，比 Python 循环快几个数量级。
+
+#### 困惑度（Perplexity）
+
+困惑度是语言模型最常用的评估指标：
+
+```python
+def perplexity(loss: torch.Tensor) -> torch.Tensor:
+    return torch.exp(loss)
+```
+
+**直觉理解：** 困惑度 ≈ "模型在预测时等效的随机选择范围"。PPL = 100 意味着模型在每个位置都像是从 100 个词中随机选一个。
+
+| PPL | 含义 |
+|---|---|
+| 1.0 | 完美预测（概率 100%） |
+| vocab_size | 均匀随机猜测 |
+| ∞ | 给真实 token 的概率为 0 |
+
+PPL 越小越好。GPT-2 在 WikiText-2 上的 PPL 约为 30，GPT-3 约为 20。
+
+---
+
+### AdamW 优化器
+
+#### 从 SGD 到 Adam
+
+| 优化器 | 更新规则 | 特点 |
+|---|---|---|
+| SGD | $θ = θ - η · g$ | 简单，但需要手动调 LR |
+| Momentum SGD | 加入一阶动量 | 加速收敛，减少震荡 |
+| Adam | 一阶 + 二阶动量自适应 | 几乎不需要调 LR |
+| **AdamW** | Adam + 解耦权重衰减 | Llama、GPT 系列标准选择 |
+
+#### Adam 的核心思想
+
+Adam 维护两个状态：
+
+1. **一阶动量（`exp_avg`）**：梯度的指数移动平均，相当于"方向"
+   $$m_t = β_1 · m_{t-1} + (1 - β_1) · g_t$$
+
+2. **二阶动量（`exp_avg_sq`）**：梯度平方的指数移动平均，相当于"步长自适应"
+   $$v_t = β_2 · v_{t-1} + (1 - β_2) · g_t^2$$
+
+更新时，用一阶动量决定方向，用二阶动量决定步长：
+
+$$θ_t = θ_{t-1} - η · \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + ε}$$
+
+其中 $\hat{m}_t$ 和 $\hat{v}_t$ 是**偏差校正**后的动量（见下文）。
+
+#### 偏差校正（Bias Correction）
+
+初始时 $m_0 = 0, v_0 = 0$，这会导致早期动量估计偏向 0。偏差校正公式：
+
+$$\hat{m}_t = \frac{m_t}{1 - β_1^t}, \quad \hat{v}_t = \frac{v_t}{1 - β_2^t}$$
+
+当 $t$ 较小时，$1 - β_1^t$ 也较小（如 $t=1, β_1=0.9$ 时为 0.1），校正后动量被放大，补偿了初始偏差。随着 $t$ 增大，校正因子趋近于 1。
+
+#### 为什么是 AdamW 而不是 Adam + L2？
+
+Adam 的原始论文把权重衰减（L2 regularization）直接加到梯度里：
+
+```python
+# Adam + L2（不推荐）
+grad = grad + weight_decay * param  # 权重衰减混入梯度
+```
+
+但这在 Adam 中**不等价于真正的 L2 正则化**，因为 Adam 的自适应学习率会改变权重衰减的实际效果。
+
+**AdamW（Decoupled Weight Decay）** 把权重衰减从梯度更新中解耦出来：
+
+```python
+# AdamW：先做权重衰减，再做 Adam 更新
+param = param * (1 - lr * weight_decay)  # 独立的权重衰减
+param = param - lr * m_hat / (sqrt(v_hat) + eps)  # Adam 更新
+```
+
+Loshchilov & Hutter (2019) 的论文证明 AdamW 在大多数任务上都优于 Adam + L2。
+
+#### 实现要点
+
+```python
+class AdamW(torch.optim.Optimizer):
+    @torch.no_grad()
+    def step(self):
+        for p in group["params"]:
+            grad = p.grad
+            state = self.state[p]
+
+            # 初始化状态
+            if len(state) == 0:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p)
+                state["exp_avg_sq"] = torch.zeros_like(p)
+
+            exp_avg = state["exp_avg"]
+            exp_avg_sq = state["exp_avg_sq"]
+            state["step"] += 1
+            t = state["step"]
+
+            # 更新动量
+            exp_avg.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=(1.0 - beta2))
+
+            # 偏差校正
+            bias_correction1 = 1.0 - beta1**t
+            bias_correction2 = 1.0 - beta2**t
+
+            # 计算步长
+            step_size = lr / bias_correction1
+            denom = (exp_avg_sq / bias_correction2).sqrt().add_(eps)
+
+            # 解耦权重衰减
+            if weight_decay != 0.0:
+                p.mul_(1.0 - lr * weight_decay)
+
+            # 参数更新
+            p.addcdiv_(exp_avg, denom, value=-step_size)
+```
+
+**关键细节：**
+- `@torch.no_grad()`：优化器更新不需要梯度，避免构建计算图
+- `addcmul_`：原地计算 `exp_avg_sq += (1-β2) * grad * grad`，节省内存
+- `addcdiv_`：原地计算 `param += (-step_size) * exp_avg / denom`
+- 默认超参数：`lr=1e-3, β1=0.9, β2=0.999, ε=1e-8, weight_decay=1e-2`
+
+---
+
+### 学习率调度（Cosine Annealing with Warmup）
+
+#### 为什么需要 Warmup？
+
+训练初期，模型参数随机初始化，梯度方向不稳定。如果一开始就用大学习率，可能导致：
+- 梯度爆炸
+- 损失函数震荡
+- 训练发散
+
+**Warmup 策略：** 前 `Tw` 步线性增加学习率，从 0 缓慢升到 `alpha_max`：
+
+```python
+if t < Tw:
+    lr = (t / Tw) * alpha_max  # 线性增长
+```
+
+#### 余弦退火（Cosine Annealing）
+
+Warmup 结束后，学习率按余弦曲线从 `alpha_max` 衰减到 `alpha_min`：
+
+```python
+progress = (t - Tw) / (Tc - Tw)  # [0, 1]
+lr = alpha_min + 0.5 * (1 + cos(π * progress)) * (alpha_max - alpha_min)
+```
+
+**为什么用余弦而不是线性衰减？**
+
+| 维度 | 线性衰减 | 余弦衰减 |
+|---|---|---|
+| 前期衰减速度 | 恒定 | 缓慢（保留较大 LR） |
+| 后期衰减速度 | 恒定 | 加速（快速收敛） |
+| 实际效果 | 基线 | 通常更好 |
+
+余弦曲线在前期下降缓慢，让模型有足够时间探索损失曲面；后期加速衰减，帮助模型稳定收敛到局部最优。
+
+#### 完整调度曲线
+
+```
+LR
+ ↑
+ |     /\
+ |    /  \
+ |   /    \      ← 余弦衰减
+ |  /      \
+ | /        \____ ← alpha_min
+ |/ warmup
+ +----------------→ step
+ 0   Tw    Tc
+```
+
+#### 实现
+
+```python
+def cosine_annealing_lr(t, alpha_max, alpha_min, Tw, Tc):
+    # Warm-up 阶段
+    if Tw > 0 and t < Tw:
+        return (t / Tw) * alpha_max
+
+    # 余弦退火阶段
+    if t <= Tc:
+        if Tc == Tw:
+            return alpha_max
+        progress = (t - Tw) / (Tc - Tw)
+        return alpha_min + 0.5 * (1 + cos(π * progress)) * (alpha_max - alpha_min)
+
+    # 退火结束后保持最小学习率
+    return alpha_min
+```
+
+**典型配置（GPT-2 风格）：**
+- `alpha_max = 6e-4`（峰值学习率）
+- `alpha_min = alpha_max * 0.1`（最小学习率）
+- `Tw = 2000`（warmup 步数）
+- `Tc = num_steps - Tw`（余弦退火总步数）
+
+---
+
+### 梯度裁剪（Gradient Clipping）
+
+#### 为什么需要梯度裁剪？
+
+深层网络中，反向传播的梯度可能累积到非常大的值（梯度爆炸），导致：
+- 参数更新步长过大，跳过最优解
+- 数值溢出（NaN）
+- 训练不稳定
+
+#### L2 范数裁剪
+
+计算所有参数梯度的全局 L2 范数，如果超过阈值 `max_l2_norm`，则等比例缩放：
+
+```python
+def gradient_clip(parameters, max_l2_norm, eps=1e-6):
+    # 1. 计算全局 L2 范数
+    total_norm = 0.0
+    for p in parameters:
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** 0.5
+
+    # 2. 计算缩放系数
+    clip_coef = max_l2_norm / (total_norm + eps)
+
+    # 3. 只在需要时裁剪
+    if clip_coef < 1.0:
+        for p in parameters:
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
+```
+
+**关键细节：**
+- `eps = 1e-6` 防止除零（当 total_norm 接近 0 时）
+- 只在 `clip_coef < 1.0` 时裁剪，避免不必要的计算
+- 等比例缩放保持梯度方向不变，只缩小幅度
+- 典型 `max_l2_norm = 1.0`（GPT-2 配置）
+
+---
+
+### 数据加载
+
+#### 随机采样 vs 顺序采样
+
+| 方式 | 特点 | 适用场景 |
+|---|---|---|
+| `get_batch`（随机） | 每次随机采样起始位置 | 训练（增加随机性） |
+| `get_batch_sequential`（顺序） | 按顺序遍历数据，无重叠 | 评估、高效训练 |
+
+#### 顺序数据加载（`data_loading_sequential`）
+
+训练时使用顺序采样可以**确保每个 token 恰好被使用一次**，没有浪费：
+
+```python
+def get_batch_sequential(x_t, batch_size, context_length, device, state, stride=None):
+    if stride is None:
+        stride = context_length  # 默认无重叠
+
+    n = x_t.numel()
+    max_start = n - context_length - 1
+
+    # 如果当前位置不够，重置到开头
+    last_start = state.pos + (batch_size - 1) * stride
+    end = last_start + context_length + 1
+    if end > n:
+        state.pos = 0
+
+    # 使用 as_strided 创建视图，避免数据拷贝
+    base = x_t[state.pos : end]
+    inputs = base.as_strided(size=(batch_size, context_length), stride=(stride, 1))
+    targets = base[1:].as_strided(size=(batch_size, context_length), stride=(stride, 1))
+
+    state.pos += batch_size * stride
+
+    # 传输到目标设备
+    inputs = inputs.to(device).long()
+    targets = targets.to(device).long()
+    return inputs, targets
+```
+
+**`as_strided` 的妙用：** 不复制数据，只改变张量的"视角"。对于 1D 序列 `[0, 1, 2, 3, 4, 5, ...]`，可以高效地创建 2D batch：
+
+```
+原始: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ...]
+
+inputs (B=2, T=3, stride=3):
+  [[0, 1, 2],
+   [3, 4, 5]]
+
+targets (偏移 1):
+  [[1, 2, 3],
+   [4, 5, 6]]
+```
+
+**内存效率：** `as_strided` 创建的是视图（view），不分配新内存。对于 GB 级别的数据集，这比 `reshape` 或 `slice` 更高效。
+
+---
+
+### 训练引擎（`train_engine.py`）
+
+#### 训练循环
+
+```python
+def train(model, optimizer, train_config):
+    # 加载数据（memmap，不一次性读入内存）
+    original_data = np.memmap(train_config.train_data_path, dtype=np.uint16, mode="r+")
+    x = torch.from_numpy(original_data)
+
+    ctx = get_ctx(train_config.use_mixed_precision, train_config.device)
+    state = BatchState(pos=0)
+
+    for step in range(train_config.num_steps):
+        # 1. 获取 batch
+        inputs, targets = data_loading_sequential(x, batch_size, context_length, device, state)
+
+        # 2. 前向传播（可选混合精度）
+        with ctx:
+            logits, aux = model(inputs)
+            logits = logits.view(-1, logits.size(-1))
+            targets = targets.view(-1)
+            loss = cross_entropy(logits, targets)
+
+        # 3. 反向传播
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+
+        # 4. 梯度裁剪
+        gradient_clip(model.parameters(), max_l2_norm=train_config.max_grad_norm)
+
+        # 5. 学习率调度
+        lr = cosine_annealing_lr(step, alpha_max, alpha_min, Tw, Tc)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
+        # 6. 参数更新
+        optimizer.step()
+```
+
+**关键设计：**
+- `np.memmap`：内存映射文件，GB 级数据集不会 OOM
+- `optimizer.zero_grad(set_to_none=True)`：把梯度设为 `None` 而不是 0，节省内存
+- `get_ctx`：根据配置返回 `torch.autocast`（混合精度）或 `nullcontext`（普通精度）
+
+#### 评估逻辑
+
+```python
+@torch.no_grad()
+def eval_model(model, train_config):
+    model.eval()
+    eval_loss = 0.0
+    eval_perplexity = 0.0
+
+    # 加载评估数据
+    original_data = np.memmap(train_config.eval_data_path, dtype=np.uint16, mode="r+")
+    x = torch.from_numpy(original_data)
+
+    total_tokens = len(original_data)
+    num_eval_batches = total_tokens // (batch_size * context_length)
+
+    state = BatchState(pos=0)
+    for _ in trange(num_eval_batches):
+        inputs, targets = data_loading_sequential(x, batch_size, context_length, device, state)
+        logits, aux = model(inputs)
+        loss = cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        eval_loss += loss.item()
+        eval_perplexity += perplexity(loss).item()
+
+    return eval_loss / num_eval_batches, eval_perplexity / num_eval_batches
+```
+
+**关键细节：**
+- `@torch.no_grad()`：评估时不构建计算图，节省内存和计算
+- `model.eval()`：关闭 dropout 等训练特有的行为
+- 评估完成后调用 `model.train()` 恢复训练模式
+
+#### 训练中的额外功能
+
+| 功能 | 触发条件 | 作用 |
+|---|---|---|
+| 评估 | `eval_log_interval` | 定期计算验证集 loss 和 PPL |
+| 文本生成 | `sampling_log_interval` | 定期生成文本，直观检查模型质量 |
+| 检查点保存 | eval loss 创新低时 | 保存最佳模型权重 |
+| W&B 日志 | `wandb_logging=True` | 可视化训练曲线 |
+| MoE 监控 | `use_moe=True` | 记录每个 expert 的 token 分配 |
+
+---
+
+### 测试
+
+```bash
+# 测试优化器
+uv run pytest tests/test_optimizer.py
+
+# 测试数据加载
+uv run pytest tests/test_data.py
+
+# 测试序列化（检查点保存/加载）
+uv run pytest tests/test_serialization.py
+```
+
+测试覆盖了：
+- `AdamW` 优化器（与 PyTorch 原生实现对比）
+- `cosine_annealing_lr` 学习率调度（验证 warmup + 余弦衰减曲线）
+- `get_batch` 随机采样（验证分布均匀性）
+- 检查点保存/加载（模型状态一致性）
+
+### 关键设计决策总结
+
+| 决策 | 选择 | 原因 |
+|---|---|---|
+| 优化器 | AdamW | 解耦权重衰减，Llama/GPT 标准 |
+| 学习率调度 | Warmup + 余弦退火 | 训练稳定，收敛效果好 |
+| 梯度裁剪 | L2 范数裁剪 | 防止梯度爆炸，训练更稳定 |
+| 数据加载 | memmap + 顺序采样 | 内存高效，无 token 浪费 |
+| 损失函数 | 手动 cross_entropy | 数值稳定，可定制 |
+| 评估指标 | Perplexity | 语言模型标准指标，直观可解释 |
+| 混合精度 | 可选 autocast | 加速训练，减少显存占用 |
