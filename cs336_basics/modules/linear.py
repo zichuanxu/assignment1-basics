@@ -8,7 +8,7 @@ class Linear(nn.Module):
         self,
         in_features,
         out_features,
-        device: torch.device = torch.device("mps"),
+        device: torch.device | None = None,
         dtype: torch.dtype | None = None,
         bias: bool = False,
     ):

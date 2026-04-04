@@ -12,7 +12,7 @@ from cs336_basics.utils_train import get_device
 @dataclass
 class ModelConfig:
     vocab_size: int = 10000
-    max_seq_len: int = 128
+    max_seq_len: int = 256
 
     d_model: int = 512
     d_ff: int = 1344
@@ -68,7 +68,7 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 32
+    batch_size: int = 128
     num_steps: int = 10_000
     dataset_dir: str = "datasets/tiny_stories"
     train_data_path: str = "datasets/tiny_stories/train.bin"
