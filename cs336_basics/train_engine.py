@@ -10,8 +10,9 @@ from cs336_basics.data import BatchState, data_loading_sequential
 from cs336_basics.generate import generate
 from cs336_basics.loss import cross_entropy, perplexity
 from cs336_basics.optim import cosine_annealing_lr, gradient_clip
-from cs336_basics.tokenizer import load_tokenizer_from_dir
-from cs336_basics.utils import clear_memory, get_ctx, print_color, save_checkpoint
+from cs336_basics.train_bpe import load_tokenizer_from_dir
+from cs336_basics.utils import print_color
+from cs336_basics.utils_train import clear_memory, get_ctx, save_checkpoint
 
 
 @torch.no_grad()
@@ -34,7 +35,9 @@ def eval_model(
     x = torch.from_numpy(original_data)
 
     total_tokens = len(original_data)
-    num_eval_batches = total_tokens // (train_config.batch_size * model.config.max_seq_len)
+    num_eval_batches = total_tokens // (
+        train_config.batch_size * model.config.max_seq_len
+    )
 
     state = BatchState(pos=0)
     with torch.no_grad():
@@ -64,7 +67,11 @@ def eval_model(
     return eval_loss, eval_perplexity
 
 
-def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, train_config: TrainingConfig):
+def train(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    train_config: TrainingConfig,
+):
     tokenizer = load_tokenizer_from_dir(train_config.dataset_dir)
 
     # Load training dataset
@@ -135,21 +142,34 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, train_config
             log_dict["train/lr"] = lr
 
         print_color(
-            f"Step {step + 1}/{train_config.num_steps}, Loss: {loss.item():.4f}, LR: {lr:.6f}", "green"
+            f"Step {step + 1}/{train_config.num_steps}, Loss: {loss.item():.4f}, LR: {lr:.6f}",
+            "green",
         )
         if model.config.use_moe:
             tokens_per_expert = aux["tokens_per_expert"]
             if model.config.use_moe and (step % train_config.log_moe_every == 0):
-                layers_to_log = sorted(set([0, model.config.num_layers // 2, model.config.num_layers - 1]))
+                layers_to_log = sorted(
+                    set([0, model.config.num_layers // 2, model.config.num_layers - 1])
+                )
                 for layer_idx in layers_to_log:
-                    tpe = tokens_per_expert[layer_idx].detach().float().cpu().numpy()  # (E,)
+                    tpe = (
+                        tokens_per_expert[layer_idx].detach().float().cpu().numpy()
+                    )  # (E,)
                     msg = " | ".join([f"E{e}:{tpe[e]:.3f}" for e in range(len(tpe))])
-                    print_color(f"[step {step}] Layer {layer_idx} tokens_per_expert: {msg}", "magenta")
+                    print_color(
+                        f"[step {step}] Layer {layer_idx} tokens_per_expert: {msg}",
+                        "magenta",
+                    )
                     if train_config.wandb_logging:
                         for e in range(len(tpe)):
-                            log_dict[f"moe/layer_{layer_idx}_expert_{e}_tokens"] = tpe[e]
+                            log_dict[f"moe/layer_{layer_idx}_expert_{e}_tokens"] = tpe[
+                                e
+                            ]
 
-        if train_config.eval_log_interval > 0 and (step + 1) % train_config.eval_log_interval == 0:
+        if (
+            train_config.eval_log_interval > 0
+            and (step + 1) % train_config.eval_log_interval == 0
+        ):
             # Cleanup
             del inputs, targets, logits, loss
             clear_memory()
@@ -161,7 +181,8 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, train_config
                 log_dict["eval/perplexity"] = eval_perplexity.item()
 
             print_color(
-                f"Eval Loss: {eval_loss.item():.4f}, Eval Perplexity: {eval_perplexity.item():.4f}", "blue"
+                f"Eval Loss: {eval_loss.item():.4f}, Eval Perplexity: {eval_perplexity.item():.4f}",
+                "blue",
             )
             if eval_loss < best_eval_loss:
                 best_eval_loss = eval_loss
@@ -180,7 +201,10 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, train_config
                 )
 
         # Sample generation
-        if train_config.sampling_log_interval > 0 and (step + 1) % train_config.sampling_log_interval == 0:
+        if (
+            train_config.sampling_log_interval > 0
+            and (step + 1) % train_config.sampling_log_interval == 0
+        ):
             generated_outputs = generate(
                 model=model,
                 prompt="Once upon a time",

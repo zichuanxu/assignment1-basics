@@ -3,13 +3,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
+
+import torch
+
 from cs336_basics.utils_train import get_device
 
 
 @dataclass
 class ModelConfig:
     vocab_size: int = 10000
-    max_seq_len: int = 256
+    max_seq_len: int = 128
 
     d_model: int = 512
     d_ff: int = 1344
@@ -65,7 +68,7 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 256
+    batch_size: int = 32
     num_steps: int = 10_000
     dataset_dir: str = "datasets/tiny_stories"
     train_data_path: str = "datasets/tiny_stories/train.bin"
@@ -87,7 +90,7 @@ class TrainingConfig:
     # Others:
     model_name: str = "tiny_stories_transformer"
     save_checkpoint_dir: str = "checkpoints"
-    device: str = get_device()
+    device: torch.device = get_device()
     debug_mode: bool = False
     use_mixed_precision: bool = True
     log_moe_every: int = 500
@@ -123,10 +126,15 @@ class TrainingConfig:
                 )
             data["betas"] = (float(b[0]), float(b[1]))
 
+        if "device" in data and isinstance(data["device"], str):
+            data["device"] = torch.device(data["device"])
+
         return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
-        return {f.name: getattr(self, f.name) for f in fields(self)}
+        data = {f.name: getattr(self, f.name) for f in fields(self)}
+        data["device"] = str(self.device)
+        return data
 
     def to_json(self, path: str | Path, *, indent: int = 2) -> None:
         path = Path(path)

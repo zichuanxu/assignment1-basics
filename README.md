@@ -1280,3 +1280,385 @@ uv run pytest tests/test_serialization.py
 | 损失函数 | 手动 cross_entropy | 数值稳定，可定制 |
 | 评估指标 | Perplexity | 语言模型标准指标，直观可解释 |
 | 混合精度 | 可选 autocast | 加速训练，减少显存占用 |
+
+---
+
+## 文本生成（Generate）
+
+### 整体架构
+
+训练完成后，模型需要能够**自回归地生成文本**。核心流程很朴素：给定一段 prompt，模型预测下一个 token 的概率分布，从中采样一个 token 追加到序列末尾，然后重复这个过程直到生成足够长度或遇到 EOS token。
+
+```
+Prompt → Model → Logits → 采样策略 → Next Token → 追加到序列 → 重复
+```
+
+### 采样策略速查
+
+| 策略 | 原理 | 多样性 | 质量 | 适用场景 |
+|---|---|---|---|---|
+| **Greedy** | 选概率最高的 token | 最低 | 稳定但可能重复 | 代码生成、确定性任务 |
+| **Top-K** | 从概率最高的 K 个中采样 | 中等（K 越大越高） | 可控 | 通用文本生成 |
+| **Top-P (Nucleus)** | 从累计概率达 P 的 token 中采样 | 动态调整 | 通常最好 | 创意写作、对话 |
+| **Temperature** | 缩放 logits 后再采样 | T>1 更高，T<1 更低 | 调节分布锐度 | 配合其他策略使用 |
+
+---
+
+### Temperature（温度缩放）
+
+#### 直觉理解
+
+Temperature 控制概率分布的"锐度"：
+
+```python
+next_token_logits = next_token_logits / temperature
+probs = softmax(next_token_logits)
+```
+
+| Temperature | 效果 | 生成风格 |
+|---|---|---|
+| `T = 0.1` | 分布极陡峭，几乎总是选最高概率 | 确定性极高，几乎不变 |
+| `T = 0.7` | 分布稍陡，偏向高概率 token | 稳定但有一定变化 |
+| `T = 1.0` | 原始分布 | 标准采样 |
+| `T = 1.5` | 分布变平坦，低概率 token 也有机会 | 更有创意，但可能不连贯 |
+| `T = 2.0+` | 分布接近均匀 | 随机性过高，质量下降 |
+
+**数学原理：** 除以 temperature 等价于对 softmax 的指数项做缩放：
+
+$$
+\text{softmax}(x/T)_i = \frac{e^{x_i/T}}{\sum_j e^{x_j/T}}
+$$
+
+当 $T < 1$ 时，$x_i/T$ 的差距被放大，高概率和低概率 token 的差距更明显。当 $T > 1$ 时，差距被缩小，分布更平坦。
+
+---
+
+### Top-K 采样
+
+#### 核心思想
+
+只保留概率最高的 K 个 token，其余设为 $-\infty$，然后重新做 softmax 并采样：
+
+```
+原始 logits: [2.0, 1.5, 1.0, 0.5, 0.1, ...]  (vocab_size=50257)
+↓ top_k=3
+过滤后:       [2.0, 1.5, 1.0, -inf, -inf, ...]
+↓ softmax
+概率:         [0.51,  0.31,  0.18,  0,     0,    ...]
+↓ multinomial
+采样结果:     从这 3 个 token 中按概率抽取
+```
+
+#### 实现
+
+```python
+def top_k_sampling(logits, top_k):
+    # 1. 取 top-k logits
+    top_k_logits, top_k_indices = torch.topk(logits, top_k, dim=-1)
+
+    # 2. 创建过滤后的 logits（其余设为 -inf）
+    filtered_logits = torch.full_like(logits, float("-inf"))
+    filtered_logits.scatter_(dim=-1, index=top_k_indices, src=top_k_logits)
+
+    # 3. softmax + 采样
+    probs = F.softmax(filtered_logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+```
+
+**关键细节：**
+- `scatter_` 把 top-k 的值放回原始位置，其余保持 `-inf`
+- `softmax(-inf) = 0`，被过滤的 token 概率为 0
+- `top_k=0` 时退化为全量采样（不过滤）
+- 典型值：`K = 10~50`，K 越小越确定，K 越大越多样
+
+---
+
+### Top-P 采样（Nucleus Sampling）
+
+#### 为什么需要 Top-P？
+
+Top-K 有一个固有问题：**固定的 K 不适用于所有情况**。
+
+- 当模型很确定时（如 "The capital of France is ___"），前 3 个 token 可能已经覆盖了 99% 的概率，此时 K=50 会引入大量低质量候选
+- 当模型不确定时（如创意写作），前 50 个 token 可能只覆盖 60% 的概率，此时 K=50 会切掉合理的长尾选项
+
+**Top-P 的解决方案：** 动态调整候选 token 数量，让累计概率达到 P 即可：
+
+```
+logits → softmax → 按概率降序排序 → 累加概率 → 找到累计概率首次 ≥ P 的位置 → 保留之前的 token
+```
+
+#### 实现
+
+```python
+def top_p_sampling(logits, top_p):
+    # 1. 降序排序
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    sorted_probs = F.softmax(sorted_logits, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # 2. 找到需要移除的 token（累计概率 > top_p 的部分）
+    sorted_indices_to_remove = cumulative_probs > top_p
+    # 向右移一位：保留累计概率首次超过 P 的那个 token
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = False
+
+    # 3. 把 mask 散射回原始位置
+    indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+    indices_to_remove.scatter_(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+
+    # 4. 过滤 + 重新 softmax + 采样
+    filtered_logits = logits.masked_fill(indices_to_remove, float("-inf"))
+    probs = F.softmax(filtered_logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+```
+
+**关键细节：**
+- `sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()` 这行是核心：它确保**保留累计概率首次超过 P 的那个 token**。举例：
+  ```
+  累计概率: [0.4, 0.7, 0.85, 0.95, 0.99, 1.0]
+  top_p = 0.9
+  > 0.9:  [F,   F,   F,    T,    T,    T]
+  右移:   [F,   F,   F,    F,    T,    T]  ← 注意第 4 个 token 被保留了
+  ```
+- 典型值：`P = 0.8~0.95`，P 越小越确定，P 越大越多样
+- Top-P 和 Top-K **互斥**，代码中通过 `assert top_p == 0.0 or top_k == 0` 保证
+
+---
+
+### 完整生成流程
+
+#### 自回归生成循环
+
+```python
+@torch.no_grad()
+def generate(model, prompt, tokenizer, max_new_tokens=256, top_k=0, top_p=0.0, temperature=1.0):
+    # 1. 编码 prompt
+    input_ids = tokenizer.encode(prompt)
+    input_ids = torch.tensor(input_ids).unsqueeze(0).to(model.device)
+    input_len = input_ids.shape[1]
+
+    # 2. 自回归生成
+    for _ in range(max_new_tokens):
+        logits, _ = model(input_ids)
+        next_token_logits = logits[:, -1, :].float()  # 只取最后一个 token 的 logits
+
+        # 3. 温度缩放
+        next_token_logits = next_token_logits / temperature
+
+        # 4. 采样
+        if top_k > 0:
+            next_token_id = top_k_sampling(next_token_logits, top_k)
+        elif top_p > 0.0:
+            next_token_id = top_p_sampling(next_token_logits, top_p)
+        else:
+            next_token_id = next_token_logits.argmax(dim=-1, keepdim=True)  # Greedy
+
+        # 5. EOS 检查
+        if next_token_id.item() == tokenizer.eos_token_id:
+            break
+
+        # 6. 追加到序列
+        input_ids = torch.cat([input_ids, next_token_id], dim=-1)
+
+    # 7. 解码
+    generated_text = tokenizer.decode(input_ids[0, input_len:].tolist())
+    return {"generated_text": generated_text, ...}
+```
+
+**关键设计：**
+- `@torch.no_grad()`：生成时不需要梯度，节省内存
+- `logits[:, -1, :]`：只取序列最后一个位置的 logits（自回归特性）
+- `.float()`：如果模型用了混合精度（bfloat16），需要转回 float32 保证采样精度
+- `torch.amp.autocast("cuda", enabled=False)`：生成时关闭混合精度，避免数值不稳定
+- EOS 检查：遇到结束 token 提前终止，避免生成无意义内容
+
+#### 生成策略推荐
+
+| 场景 | Temperature | Top-K | Top-P | 效果 |
+|---|---|---|---|---|
+| 代码生成 | 0.2~0.5 | 0 | 0 | 确定性高，语法正确 |
+| 故事创作 | 0.8 | 0 | 0.9 | 有创意且连贯 |
+| 对话系统 | 0.7 | 40 | 0 | 多样但不跑题 |
+| 诗歌/创意 | 1.2 | 0 | 0.95 | 最大多样性 |
+
+---
+
+### 关键设计决策总结
+
+| 决策 | 选择 | 原因 |
+|---|---|---|
+| 采样策略 | Top-K / Top-P 可选 | 灵活控制生成多样性 |
+| Temperature | 默认 1.0，可调 | 控制分布锐度，适配不同场景 |
+| 生成时精度 | float32（关闭 autocast） | 避免混合精度导致采样不稳定 |
+| EOS 终止 | 检测到 EOS 提前停止 | 避免生成无意义内容 |
+| 自回归方式 | 全序列前向，取最后 token | 简单直接，适合推理阶段 |
+
+
+## 完整实验流程
+
+### 0. 环境准备
+
+```bash
+# 安装 uv（如果还没有）
+brew install uv
+
+# 进入项目目录
+cd assignment1-basics
+
+# 验证环境
+uv run python -c "import torch; print(torch.__version__)"
+```
+
+### 1. 下载数据
+
+```bash
+mkdir -p data
+cd data
+
+# TinyStories
+wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
+wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt
+
+# OpenWebText
+wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz
+gunzip owt_train.txt.gz
+wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_valid.txt.gz
+gunzip owt_valid.txt.gz
+
+cd ..
+```
+
+### 2. 训练 BPE 分词器
+
+```bash
+# 训练 TinyStories 分词器并保存
+uv run python ./train_bpe.py
+
+# 验证输出
+ls datasets/tiny_stories/
+# vocab.json  merges.txt  special_tokens.txt  train.bin  eval.bin
+```
+
+### 3. 运行单元测试
+
+```bash
+# 运行所有测试
+uv run pytest
+
+# 分模块测试
+uv run pytest tests/test_tokenizer.py -v          # BPE 分词器
+uv run pytest tests/test_train_bpe.py -v          # BPE 训练
+uv run pytest tests/test_model.py -v              # Transformer 模型
+uv run pytest tests/test_nn_utils.py -v           # 神经网络工具函数
+uv run pytest tests/test_optimizer.py -v          # AdamW + LR 调度
+uv run pytest tests/test_data.py -v               # 数据加载
+uv run pytest tests/test_serialization.py -v      # 检查点保存/加载
+
+# 运行单个测试
+uv run pytest tests/test_model.py::test_run_transformer_block -v
+uv run pytest tests/test_optimizer.py::test_adamw -v
+```
+
+### 4. 训练模型
+
+```bash
+# 设置环境变量（一次性）
+export WANDB_API_KEY="your-api-key-here"
+# 使用默认配置训练（TinyStories）
+uv run python train.py
+
+# 或者在代码中修改 TrainingConfig 后运行
+# cs336_basics/config.py 中可以调整：
+#   - batch_size
+#   - num_steps
+#   - max_lr / min_lr
+#   - warmup_steps
+#   - eval_log_interval
+#   - sampling_log_interval
+#   - use_mixed_precision
+```
+
+### 5. 监控训练
+
+训练过程中会自动：
+
+- **打印日志**：每步输出 loss 和 learning rate
+- **定期评估**：按 `eval_log_interval` 计算验证集 loss 和 perplexity
+- **生成文本**：按 `sampling_log_interval` 用 "Once upon a time" 作为 prompt 生成文本，直观检查质量
+- **保存检查点**：当验证集 loss 创新低时自动保存最佳模型
+- **W&B 日志**：如果开启 `wandb_logging=True`，可以在 wandb.ai 上查看训练曲线
+
+### 6. 文本生成测试
+
+```python
+# 在 Python 中直接测试生成
+from cs336_basics.model import TransformerLM
+from cs336_basics.tokenizer import load_tokenizer_from_dir
+from cs336_basics.generate import generate
+import torch
+
+# 加载模型
+checkpoint = torch.load("checkpoints/best_model.pt", weights_only=False)
+model = checkpoint["model"]
+model.eval()
+
+# 加载分词器
+tokenizer = load_tokenizer_from_dir("datasets/tiny_stories")
+
+# Greedy 生成
+result = generate(model, "Once upon a time", tokenizer, max_new_tokens=128)
+print(result["generated_text"])
+
+# Top-K 采样（更多样）
+result = generate(model, "Once upon a time", tokenizer, max_new_tokens=128, top_k=40, temperature=0.8)
+print(result["generated_text"])
+
+# Top-P 采样（Nucleus）
+result = generate(model, "Once upon a time", tokenizer, max_new_tokens=128, top_p=0.9, temperature=0.8)
+print(result["generated_text"])
+```
+### 7. 完整实验流程示例
+
+以下是一个从零到训练完成的完整流程：
+
+```bash
+# ===== Step 1: 验证环境 =====
+uv run pytest -v --tb=short
+
+# ===== Step 2: 训练分词器 =====
+uv run python ./train_bpe.py
+
+# ===== Step 3: 验证分词器 =====
+uv run pytest tests/test_tokenizer.py -v
+uv run pytest tests/test_train_bpe.py -v
+
+# ===== Step 4: 验证模型组件 =====
+uv run pytest tests/test_model.py -v
+uv run pytest tests/test_nn_utils.py -v
+
+# ===== Step 5: 验证优化器和数据 =====
+uv run pytest tests/test_optimizer.py -v
+uv run pytest tests/test_data.py -v
+
+# ===== Step 6: 小规模训练测试（sanity check）=====
+# 设置环境变量（一次性）
+export WANDB_API_KEY="your-api-key-here"
+
+# 使用默认配置（代码中定义的默认值）
+uv run python train.py
+
+# 或者指定 JSON 配置文件
+uv run python train.py --train_config_json configs/train_small.json --model_config_json configs/model_gpt2.json
+
+# ===== Step 7: 正式训练 =====
+# 修改 config.py 中的默认配置，或传入 JSON 配置文件
+uv run python train.py --train_config_json configs/train_full.json
+
+# ===== Step 8: 检查训练结果 =====
+ls checkpoints/
+# best_model_step_XXX.pt
+
+# ===== Step 9: 加载最佳模型并生成文本 =====
+# 使用上面的 Python 代码加载并生成
+```

@@ -1,7 +1,9 @@
 import warnings
 from functools import wraps
+from rich import print
 
 # ================================ 通用工具函数 ==================================
+
 
 def print_color(content: str, color: str = "green"):
     print(f"[{color}]{content}[/{color}]")
