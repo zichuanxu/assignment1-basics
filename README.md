@@ -1590,34 +1590,11 @@ uv run python train.py
 - **W&B 日志**：如果开启 `wandb_logging=True`，可以在 wandb.ai 上查看训练曲线
 
 ### 6. 文本生成测试
-
-```python
-# 在 Python 中直接测试生成
-from cs336_basics.model import TransformerLM
-from cs336_basics.tokenizer import load_tokenizer_from_dir
-from cs336_basics.generate import generate
-import torch
-
-# 加载模型
-checkpoint = torch.load("checkpoints/best_model.pt", weights_only=False)
-model = checkpoint["model"]
-model.eval()
-
-# 加载分词器
-tokenizer = load_tokenizer_from_dir("datasets/tiny_stories")
-
-# Greedy 生成
-result = generate(model, "Once upon a time", tokenizer, max_new_tokens=128)
-print(result["generated_text"])
-
-# Top-K 采样（更多样）
-result = generate(model, "Once upon a time", tokenizer, max_new_tokens=128, top_k=40, temperature=0.8)
-print(result["generated_text"])
-
-# Top-P 采样（Nucleus）
-result = generate(model, "Once upon a time", tokenizer, max_new_tokens=128, top_p=0.9, temperature=0.8)
-print(result["generated_text"])
+```bash
+uv run python generate.py
 ```
+
+
 ### 7. 完整实验流程示例
 
 以下是一个从零到训练完成的完整流程：
@@ -1629,36 +1606,16 @@ uv run pytest -v --tb=short
 # ===== Step 2: 训练分词器 =====
 uv run python ./train_bpe.py
 
-# ===== Step 3: 验证分词器 =====
-uv run pytest tests/test_tokenizer.py -v
-uv run pytest tests/test_train_bpe.py -v
+# ===== Step 3: 运行所有测试 =====
+uv run pytest
 
-# ===== Step 4: 验证模型组件 =====
-uv run pytest tests/test_model.py -v
-uv run pytest tests/test_nn_utils.py -v
-
-# ===== Step 5: 验证优化器和数据 =====
-uv run pytest tests/test_optimizer.py -v
-uv run pytest tests/test_data.py -v
-
-# ===== Step 6: 小规模训练测试（sanity check）=====
+# ===== Step 4: 训练 =====
 # 设置环境变量（一次性）
 export WANDB_API_KEY="your-api-key-here"
 
 # 使用默认配置（代码中定义的默认值）
 uv run python train.py
 
-# 或者指定 JSON 配置文件
-uv run python train.py --train_config_json configs/train_small.json --model_config_json configs/model_gpt2.json
-
-# ===== Step 7: 正式训练 =====
-# 修改 config.py 中的默认配置，或传入 JSON 配置文件
-uv run python train.py --train_config_json configs/train_full.json
-
-# ===== Step 8: 检查训练结果 =====
-ls checkpoints/
-# best_model_step_XXX.pt
-
-# ===== Step 9: 加载最佳模型并生成文本 =====
-# 使用上面的 Python 代码加载并生成
+# ===== Step 5: 加载最佳模型并生成文本 =====
+uv run python generate.py
 ```
